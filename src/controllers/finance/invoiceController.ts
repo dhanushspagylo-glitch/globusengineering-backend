@@ -1510,6 +1510,9 @@ export const deleteInvoice = async (req: AuthRequest, res: Response) => {
       await (tx as any).legacyInvoice.delete({
         where: { id: parseInt(String(id)) }
       });
+    }, {
+      maxWait: 15000,
+      timeout: 45000
     });
 
     // Logging Audit
