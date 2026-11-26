@@ -1,0 +1,211 @@
+import { Response } from 'express';
+import prisma from '../../config/prisma';
+import { AuthRequest } from '../../middleware/authMiddleware';
+
+// In-memory cache for dashboard stats (30 seconds TTL per company)
+const statsCache = new Map<string, { data: any; expiresAt: number }>();
+
+/**
+ * Aggregates financial data for the dashboard
+ */
+export const getFinanceStats = async (req: AuthRequest, res: Response) => {
+  const user = req.user;
+  const queryCompanyId = (req.query.company_id || req.query.companyId) as string;
+  let companyId = queryCompanyId || user?.company_id || (user as any)?.companyId;
+
+  // Strict resolution: If context is missing in token/query, fetch from DB
+  if (!companyId && user?.id) {
+    try {
+      const dbUser = await prisma.user.findUnique({
+        where: { id: user.id },
+        select: { company_id: true }
+      });
+      if (dbUser?.company_id) companyId = dbUser.company_id;
+    } catch (err) {}
+  }
+
+  if (!companyId && user?.role !== 'super_admin') {
+    return res.status(400).json({ error: 'Company ID is required for dashboard statistics.' });
+  }
+
+  // Check in-memory cache
+  const cacheKey = String(companyId || 'global');
+  const cached = statsCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) {
+    res.setHeader('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
+    return res.json(cached.data);
+  }
+
+  try {
+    // 1. Run queries in parallel to save time and reduce connection hold duration
+    const companyWhere = {
+      OR: [
+        { company_id: String(companyId) },
+        { company_id: String(companyId).toLowerCase() },
+        { company_id: String(companyId).toUpperCase() }
+      ]
+    };
+
+    const [invoices, customerCount, vendorCount, latestInvoices, latestInwards] = await Promise.all([
+      prisma.legacyInvoice.findMany({
+        where: companyWhere,
+        select: {
+          id: true,
+          invoice_no: true,
+          customer_name: true,
+          due_date: true,
+          invoice_date: true,
+          sub_total: true,
+          total: true,
+          tax_total: true,
+          grand_total: true,
+          paid_amount: true,
+          status: true,
+          customer: {
+            select: { customer_name: true }
+          }
+        }
+      }),
+      prisma.legacyCustomer.count({ where: companyWhere }),
+      prisma.vendor.count({ where: companyWhere }),
+      prisma.legacyInvoice.findMany({
+        where: companyWhere,
+        select: {
+          id: true,
+          invoice_no: true,
+          invoice_date: true,
+          customer_name: true,
+          grand_total: true,
+          status: true,
+          customer: { select: { customer_name: true } }
+        },
+        orderBy: [
+          { invoice_date: 'desc' },
+          { id: 'desc' }
+        ],
+        take: 10
+      }),
+      prisma.inwardEntry.findMany({
+        where: companyWhere,
+        orderBy: [
+          { date: 'desc' },
+          { created_at: 'desc' }
+        ],
+        take: 10,
+        select: {
+          id: true,
+          inward_no: true,
+          date: true,
+          vendor_name: true,
+          customer_name: true,
+          status: true
+        }
+      })
+    ]);
+
+    let totalInvoiced = 0;
+    let totalPaid = 0;
+    const pendingInvoices: any[] = [];
+    let overdueCount = 0;
+
+    const today = new Date();
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(today.getDate() - 30);
+
+    invoices.forEach(inv => {
+      // Use Float columns if available, otherwise parse legacy String columns
+      const taxable = inv.sub_total ?? (parseFloat(String(inv.total || '0').replace(/[^\d.]/g, '')) || 0);
+      const taxVal  = inv.tax_total ?? (parseFloat(String(inv.tax_total || '0').replace(/[^\d.]/g, '')) || 0);
+      
+      let grand = parseFloat(String(inv.grand_total || '0').replace(/[^\d.]/g, '')) || 0;
+      
+      // Fallback: Reconstruct grand total if string column is zero/empty
+      if (grand <= 0 && taxable > 0) {
+          grand = taxable + taxVal;
+      }
+
+      const paid = parseFloat(String(inv.paid_amount || '0').replace(/[^\d.]/g, '')) || 0;
+
+      totalInvoiced += grand;
+      totalPaid += paid;
+
+      // Check if unpaid (balance > 0.5 and status is not paid/completed/closed/cancelled)
+      const cleanStatus = (inv.status || '').trim().toUpperCase();
+      const isPaidStatus = cleanStatus === 'PAID' || cleanStatus === 'COMPLETED' || cleanStatus === 'CLOSED' || cleanStatus === 'SETTLED' || cleanStatus === 'CANCELLED';
+      const isUnpaid = (grand - paid) > 0.5 && !isPaidStatus;
+      const dueDate = inv.due_date || inv.invoice_date;
+
+      if (isUnpaid) {
+        pendingInvoices.push({
+          id: inv.id,
+          invoice_no: inv.invoice_no,
+          customer: inv.customer_name || inv.customer?.customer_name || 'Unknown Customer',
+          amount: grand,
+          pending: Math.max(0, grand - paid),
+          due_date: dueDate
+        });
+
+        // Still track overdue count (> 30 days) for the stat card
+        if (dueDate && new Date(dueDate) < thirtyDaysAgo) {
+          overdueCount++;
+        }
+      }
+    });
+
+    // Sort by invoice_date descending and take top 10
+    const overdueInvoices = pendingInvoices
+      .sort((a, b) => {
+        const dateA = new Date(a.due_date || 0).getTime();
+        const dateB = new Date(b.due_date || 0).getTime();
+        if (dateB !== dateA) return dateB - dateA;
+        return b.id - a.id; // Use ID as tie-breaker for "latest created"
+      })
+      .slice(0, 10);
+
+    const totalPendingActual = pendingInvoices.reduce((sum, item) => sum + (item.pending || 0), 0);
+
+    const responsePayload = {
+      summary: {
+        totalInvoiced: Math.round(totalInvoiced * 100) / 100,
+        totalPaid: Math.round(totalPaid * 100) / 100,
+        pendingAmount: Math.round(totalPendingActual * 100) / 100,
+        customerCount,
+        vendorCount,
+        overdueCount
+      },
+      overdueInvoices,
+      latestInvoices: latestInvoices.map((inv: any) => ({
+        id: inv.id,
+        invoice_no: inv.invoice_no,
+        invoice_date: inv.invoice_date,
+        customer_name: inv.customer_name || inv.customer?.customer_name || 'Unknown Customer',
+        grand_total: inv.grand_total,
+        status: inv.status
+      })),
+      latestInwards
+    };
+
+    // Cache for 30 seconds
+    statsCache.set(cacheKey, { data: responsePayload, expiresAt: Date.now() + 30000 });
+    res.setHeader('Cache-Control', 'private, max-age=30, stale-while-revalidate=60');
+    res.json(responsePayload);
+
+  } catch (error: any) {
+    console.error('DASHBOARD STATS ERROR:', error);
+
+    // Handle Connection Failures (P1001) specifically for Hostinger Remote MySQL
+    if (error.code === 'P1001') {
+      return res.status(503).json({
+        error: 'Database Connection Error',
+        detail: 'The backend cannot reach the Hostinger MySQL server. Please ensure your current IP is whitelisted in Hostinger Remote MySQL settings.',
+        host: 'srv1214.hstgr.io'
+      });
+    }
+
+    res.status(500).json({
+      error: 'Failed to aggregate dashboard data',
+      detail: error.message
+    });
+  }
+};

@@ -1,0 +1,759 @@
+import { Response } from 'express';
+import prisma from '../../config/prisma';
+import { AuthRequest } from '../../middleware/authMiddleware';
+import crypto from 'crypto';
+import { generateNextSequence } from '../../utils/sequenceGenerator';
+import { getItemKey, getGenericKey, consumeFromPools } from './inwardController';
+
+let customerNotesColumnEnsured = false;
+async function ensureCustomerNotesColumn() {
+  if (customerNotesColumnEnsured) return;
+  try {
+    await prisma.$executeRawUnsafe('ALTER TABLE app_outward_entries ADD COLUMN customer_notes TEXT NULL');
+  } catch (e) {
+    // Column already exists
+  }
+  customerNotesColumnEnsured = true;
+}
+
+export const getOutwardEntries = async (req: AuthRequest, res: Response) => {
+  const queryCompanyId = (req.query.companyId || req.query.company_id) as string;
+  const user = req.user;
+  const companyId = user?.role === 'super_admin' ? queryCompanyId : (user?.company_id || (user as any)?.companyId || queryCompanyId);
+
+  // Pagination & Filter Params
+  const page = parseInt(req.query.page as string) || 1;
+  const limit = parseInt(req.query.limit as string) || 10;
+  const skip = (page - 1) * limit;
+  const search = (req.query.search as string || '').toLowerCase();
+  const sortBy = req.query.sortBy as string;
+  const sortOrder = (req.query.sortOrder as string) === 'asc' ? 'asc' : 'desc';
+
+  try {
+    const where: any = {
+      AND: []
+    };
+
+    if (companyId) {
+      where.AND.push({
+        OR: [
+          { company_id: String(companyId) },
+          { company_id: String(companyId).toLowerCase() },
+          { company_id: String(companyId).toUpperCase() }
+        ]
+      });
+    }
+
+    if (search) {
+      where.AND.push({
+        OR: [
+          { outward_no: { contains: search } },
+          { customer_name: { contains: search } },
+          { vendor_name: { contains: search } },
+          { challan_no: { contains: search } },
+          { vehicle_no: { contains: search } }
+        ]
+      });
+    }
+
+    const partyType = req.query.partyType as string;
+    if (partyType && partyType !== 'all') {
+      if (partyType === 'customer') {
+        where.AND.push({
+          OR: [
+            { party_type: 'customer' },
+            { party_type: null },
+            { party_type: '' }
+          ]
+        });
+      } else {
+        where.AND.push({ party_type: partyType });
+      }
+    }
+
+    const customerId = (req.query.customerId || req.query.customer_id) as string;
+    if (customerId && customerId !== 'all') {
+      const orConditions: any[] = [
+        { customer_id: String(customerId) },
+        { vendor_id: String(customerId) }
+      ];
+
+      const parsedId = parseInt(customerId, 10);
+      if (!isNaN(parsedId)) {
+        try {
+          const cust = await prisma.legacyCustomer.findUnique({
+            where: { id: parsedId },
+            select: { customer_name: true }
+          });
+          if (cust?.customer_name) {
+            orConditions.push({ customer_name: cust.customer_name });
+          }
+        } catch (e) { }
+      } else {
+        try {
+          const vendor = await prisma.vendor.findFirst({
+            where: { id: customerId },
+            select: { name: true }
+          });
+          if (vendor?.name) {
+            orConditions.push({ vendor_name: vendor.name });
+          }
+        } catch (e) { }
+      }
+
+      where.AND.push({
+        OR: orConditions
+      });
+    }
+
+    const status = req.query.status as string;
+    if (status && status !== 'all') {
+      where.AND.push({ status: status });
+    }
+
+    const fromDate = req.query.fromDate as string;
+    const toDate = req.query.toDate as string;
+    if (fromDate || toDate) {
+      const dateFilter: any = {};
+      if (fromDate) dateFilter.gte = new Date(fromDate);
+      if (toDate) {
+        const endOfDay = new Date(toDate);
+        endOfDay.setHours(23, 59, 59, 999);
+        dateFilter.lte = endOfDay;
+      }
+      where.AND.push({ date: dateFilter });
+    }
+
+    await ensureCustomerNotesColumn();
+
+    const [entries, totalCount] = await Promise.all([
+      prisma.outwardEntry.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: sortBy ? { [sortBy]: sortOrder } : [
+          { date: 'desc' },
+          { outward_no: 'desc' },
+          { created_at: 'desc' }
+        ]
+      }),
+      prisma.outwardEntry.count({ where })
+    ]);
+
+    const customerNotesMap = new Map<string, string>();
+    if (entries.length > 0) {
+      try {
+        const placeholders = entries.map(() => '?').join(',');
+        const rows: any[] = await prisma.$queryRawUnsafe(
+          `SELECT id, customer_notes FROM app_outward_entries WHERE id IN (${placeholders})`,
+          ...entries.map((e: any) => String(e.id))
+        );
+        rows.forEach((r: any) => {
+          customerNotesMap.set(String(r.id), r.customer_notes || '');
+        });
+      } catch (e) { }
+    }
+
+    const parsedEntries = entries.map((e: any) => {
+      const resolvedCustomerNotes = e.customer_notes ?? customerNotesMap.get(String(e.id)) ?? '';
+      return {
+        ...e,
+        outwardNo: e.outward_no,
+        partyType: e.party_type,
+        customerId: e.customer_id,
+        customerName: e.customer_name,
+        vendorId: e.vendor_id,
+        vendorName: e.vendor_name,
+        processName: e.process_name,
+        coatingName: e.coating_name,
+        purpose: e.purpose,
+        notes: e.notes,
+        customer_notes: resolvedCustomerNotes,
+        customerNotes: resolvedCustomerNotes,
+        invoiceReference: e.invoice_reference,
+        challanNo: e.challan_no,
+        vehicleNo: e.vehicle_no,
+        driverName: e.driver_name,
+        companyId: e.company_id,
+        inwardId: e.inward_id,
+        inwardNo: e.inward_no,
+        amount: e.amount || 0,
+        customerJobValue: e.amount || 0,
+        jobValue: e.amount || 0,
+        createdAt: e.created_at,
+        items: JSON.parse(e.items_json || '[]')
+      };
+    });
+
+    res.json({
+      items: parsedEntries,
+      pagination: {
+        total: totalCount,
+        page,
+        limit,
+        totalPages: Math.ceil(totalCount / limit)
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch outward entries', detail: error.message });
+  }
+};
+
+export const createOutwardEntry = async (req: AuthRequest, res: Response) => {
+  const {
+    outward_no, outwardNo,
+    party_type, partyType,
+    customer_id, customerId,
+    customer_name, customerName,
+    vendor_id, vendorId,
+    vendor_name, vendorName,
+    process_name, processName,
+    invoice_reference, invoiceReference,
+    challan_no, challanNo,
+    vehicle_no, vehicleNo,
+    driver_name, driverName,
+    notes, customer_notes, customerNotes, status, items, company_id, companyId,
+    inward_id, inwardId,
+    inward_no, inwardNo,
+    coating_name, coatingName,
+    purpose, date
+  } = req.body;
+  const user = req.user;
+  const finalCompanyId = user?.role === 'super_admin' ? (company_id || companyId) : user?.company_id;
+
+  const finalPartyType = party_type || partyType || 'customer';
+  const prefix = finalPartyType === 'vendor' ? 'CH-VD-' : 'CH-CU-';
+  const finalOutwardNo = outward_no || outwardNo || await generateNextSequence('app_outward_entries', 'outward_no', prefix, finalCompanyId, 2001);
+  const finalCustomerId = customer_id || customerId;
+  const finalCustomerName = customer_name || customerName;
+  const finalVendorId = vendor_id || vendorId;
+  const finalVendorName = vendor_name || vendorName;
+  const finalProcessName = process_name || processName;
+  const finalInwardId = inward_id || inwardId;
+  const finalInwardNo = inward_no || inwardNo;
+  const finalCustomerNotes = String(customer_notes ?? customerNotes ?? '');
+
+  try {
+    await ensureCustomerNotesColumn();
+    const entry = await prisma.$transaction(async (tx) => {
+      const newEntry = await (tx.outwardEntry as any).create({
+        data: {
+          id: crypto.randomUUID(),
+          outward_no: finalOutwardNo,
+          party_type: finalPartyType,
+          customer_id: finalCustomerId,
+          customer_name: finalCustomerName,
+          vendor_id: finalVendorId,
+          vendor_name: finalVendorName,
+          process_name: finalProcessName,
+          invoice_reference: String(invoice_reference || invoiceReference || ''),
+          challan_no: String(challan_no || challanNo || ''),
+          vehicle_no: String(vehicle_no || vehicleNo || ''),
+          driver_name: String(driver_name || driverName || ''),
+          notes: String(notes || ''),
+          company_id: finalCompanyId,
+          inward_id: String(finalInwardId || ''),
+          inward_no: String(finalInwardNo || ''),
+          coating_name: String(coating_name || coatingName || ''),
+          purpose: String(purpose || ''),
+          status: status || 'completed',
+          amount: parseFloat(String(req.body.amount || req.body.customerJobValue || req.body.customer_job_value || req.body.jobValue || '0')),
+          items_json: JSON.stringify(items || []),
+          date: date ? new Date(date) : new Date()
+        }
+      });
+
+      await tx.$executeRawUnsafe(
+        'UPDATE app_outward_entries SET customer_notes = ? WHERE id = ?',
+        finalCustomerNotes,
+        newEntry.id
+      );
+
+      // DUAL-COMPLETION STATUS UPDATE
+      if (finalInwardId) {
+        const inwardIdStr = String(finalInwardId);
+        const inward = await tx.inwardEntry.findUnique({ where: { id: inwardIdStr } });
+        if (inward) {
+          const originalItems = JSON.parse(inward.items_json || '[]');
+          const searchIds = [inwardIdStr];
+          if (inward.inward_no) {
+            searchIds.push(String(inward.inward_no));
+            searchIds.push(`inw_${inward.inward_no}`);
+          }
+          const invoiceOr: any[] = [{ inward_id: { in: searchIds } }];
+          if (inward.inward_no && !isNaN(parseInt(String(inward.inward_no), 10))) {
+            invoiceOr.push({ inward_no: parseInt(String(inward.inward_no), 10) });
+          }
+          if (inward.dc_no && inward.customer_id && !isNaN(parseInt(String(inward.customer_id), 10))) {
+            invoiceOr.push({
+              dc_no: String(inward.dc_no).trim(),
+              customer_id: parseInt(String(inward.customer_id), 10)
+            });
+          }
+          const targetCompId = inward.company_id || req.body.company_id || req.body.companyId || req.user?.company_id;
+          const invWhere: any = { OR: invoiceOr };
+          if (targetCompId) {
+            invWhere.company_id = String(targetCompId);
+          }
+          const outWhere: any = {
+            OR: [
+              { inward_id: { in: searchIds } },
+              { inward_no: { in: searchIds } }
+            ]
+          };
+          if (targetCompId) {
+            outWhere.company_id = String(targetCompId);
+          }
+          const allInvoices = await (tx as any).legacyInvoice.findMany({ where: invWhere });
+          const allOutwards = await tx.outwardEntry.findMany({ where: outWhere });
+
+          const invoicedSpecific = new Map<string, number>();
+          const invoicedGeneric = new Map<string, number>();
+          const dispatchedSpecific = new Map<string, number>();
+          const dispatchedGeneric = new Map<string, number>();
+
+          allInvoices.forEach((inv: any) => {
+            const invItems = JSON.parse(inv.items_json || '[]');
+            invItems.forEach((ii: any) => {
+              const qty = (parseFloat(ii.qty || ii.quantity || '0') + parseFloat(ii.wopQty || ii.wop_qty || '0'));
+              if (qty <= 0) return;
+              const d = String(ii.description || ii.item_name || '').toLowerCase().trim();
+              const p = String(ii.process || '').toLowerCase().trim();
+              if (p) {
+                invoicedSpecific.set(getItemKey(d, p), (invoicedSpecific.get(getItemKey(d, p)) || 0) + qty);
+              } else if (d) {
+                invoicedGeneric.set(d, (invoicedGeneric.get(d) || 0) + qty);
+              }
+            });
+          });
+
+          allOutwards.forEach((ow: any) => {
+            const owItems = JSON.parse(ow.items_json || '[]');
+            owItems.forEach((oi: any) => {
+              if (ow.party_type !== 'vendor') {
+                const qty = parseFloat(oi.quantity || oi.qty || '0');
+                if (qty <= 0) return;
+                const d = String(oi.description || oi.item_name || '').toLowerCase().trim();
+                const p = String(oi.process || '').toLowerCase().trim();
+                if (p) {
+                  dispatchedSpecific.set(getItemKey(d, p), (dispatchedSpecific.get(getItemKey(d, p)) || 0) + qty);
+                } else if (d) {
+                  dispatchedGeneric.set(d, (dispatchedGeneric.get(d) || 0) + qty);
+                }
+              }
+            });
+          });
+
+          let allBilled = true;
+          let allDispatched = true;
+
+          originalItems.forEach((item: any) => {
+            const original = parseFloat(item.quantity || item.qty || '0');
+            const d = String(item.description || item.item_name || '').toLowerCase().trim();
+            const p = String(item.process || '').toLowerCase().trim();
+            const billed = consumeFromPools(invoicedSpecific, invoicedGeneric, original, d, p);
+            const dispatched = consumeFromPools(dispatchedSpecific, dispatchedGeneric, original, d, p);
+            if (billed < original - 0.5) allBilled = false;
+            if (dispatched < original - 0.5) allDispatched = false;
+          });
+
+          await tx.inwardEntry.update({
+            where: { id: inwardIdStr },
+            data: { status: (allBilled && allDispatched) ? 'completed' : 'pending' }
+          });
+        }
+      }
+
+      return newEntry;
+    }, {
+      timeout: 20000
+    });
+
+    // 2. AUTOMATIC LEDGER ENTRY REMOVED as per request.
+    // (Previously, this block created a 'debit' entry for Vendor Job Work)
+
+    res.status(201).json({
+      ...entry,
+      customer_notes: finalCustomerNotes,
+      customerNotes: finalCustomerNotes,
+      items: JSON.parse((entry as any).items_json || '[]')
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to create outward entry', detail: error.message });
+  }
+};
+
+export const updateOutwardEntry = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  const {
+    outward_no, outwardNo,
+    party_type, partyType,
+    customer_id, customerId,
+    customer_name, customerName,
+    vendor_id, vendorId,
+    vendor_name, vendorName,
+    process_name, processName,
+    invoice_reference, invoiceReference,
+    challan_no, challanNo,
+    vehicle_no, vehicleNo,
+    driver_name, driverName,
+    notes, customer_notes, customerNotes, status, items,
+    coating_name, coatingName,
+    purpose, date
+  } = req.body;
+
+  const finalOutwardNo = outward_no || outwardNo;
+  const finalPartyType = party_type || partyType;
+  const finalVendorId = vendor_id || vendorId;
+  const finalVendorName = vendor_name || vendorName;
+  const finalProcessName = process_name || processName;
+  const finalCustomerNotes = customer_notes !== undefined ? customer_notes : customerNotes;
+
+  try {
+    await ensureCustomerNotesColumn();
+    const entry = await prisma.$transaction(async (tx) => {
+      const updatedEntry = await (tx.outwardEntry as any).update({
+        where: { id: String(id) },
+        data: {
+          outward_no: finalOutwardNo,
+          party_type: finalPartyType,
+          customer_id: customer_id !== undefined ? customer_id : customerId,
+          customer_name: customer_name !== undefined ? customer_name : customerName,
+          vendor_id: finalVendorId,
+          vendor_name: finalVendorName,
+          process_name: finalProcessName,
+          invoice_reference: invoice_reference !== undefined ? invoice_reference : invoiceReference,
+          challan_no: challan_no !== undefined ? challan_no : challanNo,
+          vehicle_no: vehicle_no !== undefined ? vehicle_no : (vehicleNo !== undefined ? vehicleNo : undefined),
+          driver_name: driver_name !== undefined ? driver_name : driverName,
+          notes,
+          status,
+          coating_name: coating_name || coatingName,
+          purpose,
+          date: date ? new Date(date) : undefined,
+          items_json: items ? JSON.stringify(items) : undefined,
+          amount: parseFloat(String(req.body.amount || req.body.customerJobValue || req.body.customer_job_value || req.body.jobValue || 0)),
+        }
+      });
+
+      if (finalCustomerNotes !== undefined) {
+        await tx.$executeRawUnsafe(
+          'UPDATE app_outward_entries SET customer_notes = ? WHERE id = ?',
+          String(finalCustomerNotes || ''),
+          String(id)
+        );
+      }
+
+      // DUAL-COMPLETION STATUS UPDATE
+      const effInwardId = updatedEntry.inward_id;
+      if (effInwardId) {
+        const inwardIdStr = String(effInwardId);
+        const inward = await tx.inwardEntry.findUnique({ where: { id: inwardIdStr } });
+        if (inward) {
+          const originalItems = JSON.parse(inward.items_json || '[]');
+          const searchIds = [inwardIdStr];
+          if (inward.inward_no) {
+            searchIds.push(String(inward.inward_no));
+            searchIds.push(`inw_${inward.inward_no}`);
+          }
+          const invoiceOr: any[] = [{ inward_id: { in: searchIds } }];
+          if (inward.inward_no && !isNaN(parseInt(String(inward.inward_no), 10))) {
+            invoiceOr.push({ inward_no: parseInt(String(inward.inward_no), 10) });
+          }
+          if (inward.dc_no && inward.customer_id && !isNaN(parseInt(String(inward.customer_id), 10))) {
+            invoiceOr.push({
+              dc_no: String(inward.dc_no).trim(),
+              customer_id: parseInt(String(inward.customer_id), 10)
+            });
+          }
+          const targetCompId = inward.company_id || req.body.company_id || req.body.companyId || req.user?.company_id;
+          const invWhere: any = { OR: invoiceOr };
+          if (targetCompId) {
+            invWhere.company_id = String(targetCompId);
+          }
+          const outWhere: any = {
+            OR: [
+              { inward_id: { in: searchIds } },
+              { inward_no: { in: searchIds } }
+            ]
+          };
+          if (targetCompId) {
+            outWhere.company_id = String(targetCompId);
+          }
+          const allInvoices = await (tx as any).legacyInvoice.findMany({ where: invWhere });
+          const allOutwards = await tx.outwardEntry.findMany({ where: outWhere });
+
+          const invoicedSpecific = new Map<string, number>();
+          const invoicedGeneric = new Map<string, number>();
+          const dispatchedSpecific = new Map<string, number>();
+          const dispatchedGeneric = new Map<string, number>();
+
+          allInvoices.forEach((inv: any) => {
+            const invItems = JSON.parse(inv.items_json || '[]');
+            invItems.forEach((ii: any) => {
+              const qty = (parseFloat(ii.qty || ii.quantity || '0') + parseFloat(ii.wopQty || ii.wop_qty || '0'));
+              if (qty <= 0) return;
+              const d = String(ii.description || ii.item_name || '').toLowerCase().trim();
+              const p = String(ii.process || '').toLowerCase().trim();
+              if (p) {
+                invoicedSpecific.set(getItemKey(d, p), (invoicedSpecific.get(getItemKey(d, p)) || 0) + qty);
+              } else if (d) {
+                invoicedGeneric.set(d, (invoicedGeneric.get(d) || 0) + qty);
+              }
+            });
+          });
+
+          allOutwards.forEach((ow: any) => {
+            const owItems = JSON.parse(ow.items_json || '[]');
+            owItems.forEach((oi: any) => {
+              if (ow.party_type !== 'vendor') {
+                const qty = parseFloat(oi.quantity || oi.qty || '0');
+                if (qty <= 0) return;
+                const d = String(oi.description || oi.item_name || '').toLowerCase().trim();
+                const p = String(oi.process || '').toLowerCase().trim();
+                if (p) {
+                  dispatchedSpecific.set(getItemKey(d, p), (dispatchedSpecific.get(getItemKey(d, p)) || 0) + qty);
+                } else if (d) {
+                  dispatchedGeneric.set(d, (dispatchedGeneric.get(d) || 0) + qty);
+                }
+              }
+            });
+          });
+
+          let allBilled = true;
+          let allDispatched = true;
+
+          originalItems.forEach((item: any) => {
+            const original = parseFloat(item.quantity || item.qty || '0');
+            const d = String(item.description || item.item_name || '').toLowerCase().trim();
+            const p = String(item.process || '').toLowerCase().trim();
+            const billed = consumeFromPools(invoicedSpecific, invoicedGeneric, original, d, p);
+            const dispatched = consumeFromPools(dispatchedSpecific, dispatchedGeneric, original, d, p);
+            if (billed < original - 0.5) allBilled = false;
+            if (dispatched < original - 0.5) allDispatched = false;
+          });
+
+          await tx.inwardEntry.update({
+            where: { id: inwardIdStr },
+            data: { status: (allBilled && allDispatched) ? 'completed' : 'pending' }
+          });
+        }
+      }
+
+      return updatedEntry;
+    }, {
+      timeout: 20000
+    });
+
+    // 2. AUTOMATIC LEDGER SYNC REMOVED as per request.
+    // (Previously, this block synced the 'debit' entry for Vendor Job Work)
+
+    res.json({
+      ...entry,
+      customer_notes: finalCustomerNotes !== undefined ? String(finalCustomerNotes || '') : (entry as any).customer_notes,
+      customerNotes: finalCustomerNotes !== undefined ? String(finalCustomerNotes || '') : (entry as any).customer_notes,
+      items: JSON.parse((entry as any).items_json || '[]')
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to update outward entry', detail: error.message });
+  }
+};
+
+export const deleteOutwardEntry = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    await prisma.outwardEntry.delete({ where: { id: String(id) } });
+    res.json({ message: 'Outward entry deleted successfully' });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to delete outward entry', detail: error.message });
+  }
+};
+
+export const getOutwardById = async (req: AuthRequest, res: Response) => {
+  const { id } = req.params;
+  try {
+    await ensureCustomerNotesColumn();
+    const entry = await prisma.outwardEntry.findUnique({
+      where: { id: String(id) }
+    });
+
+    if (!entry) {
+      return res.status(404).json({ error: 'Outward entry not found' });
+    }
+
+    let resolvedCustomerNotes = (entry as any).customer_notes || '';
+    if (!resolvedCustomerNotes) {
+      try {
+        const rows: any[] = await prisma.$queryRawUnsafe(
+          'SELECT customer_notes FROM app_outward_entries WHERE id = ? LIMIT 1',
+          String(id)
+        );
+        if (rows && rows[0]) {
+          resolvedCustomerNotes = rows[0].customer_notes || '';
+        }
+      } catch (e) { }
+    }
+
+    let address = '';
+    let gstin = '';
+    let phone = '';
+    let pan = '';
+
+    if (entry.party_type === 'vendor' || entry.vendor_id) {
+      let vend = null;
+      if (entry.vendor_id) {
+        vend = await prisma.vendor.findUnique({
+          where: { id: String(entry.vendor_id) }
+        });
+      }
+      if (!vend && entry.vendor_name) {
+        vend = await prisma.vendor.findFirst({
+          where: { name: entry.vendor_name }
+        });
+      }
+      if (vend) {
+        const parts = [vend.street1, vend.street2, vend.area, vend.city, vend.state, vend.pin_code].filter(Boolean);
+        address = parts.join(', ');
+        gstin = vend.gst || (vend as any).gstin || '';
+        phone = vend.phone || '';
+        pan = (vend as any).pan || '';
+      }
+    } else {
+      let cust = null;
+      if (entry.customer_id) {
+        const parsedCId = parseInt(entry.customer_id, 10);
+        if (!isNaN(parsedCId)) {
+          cust = await prisma.legacyCustomer.findUnique({
+            where: { id: parsedCId }
+          });
+        }
+      }
+      if (!cust && entry.customer_name) {
+        cust = await prisma.legacyCustomer.findFirst({
+          where: { customer_name: entry.customer_name }
+        });
+      }
+      if (cust) {
+        const parts = [cust.street1, cust.street2, cust.area, cust.city, cust.state, cust.pin_code].filter(Boolean);
+        address = parts.join(', ');
+        gstin = cust.gst || '';
+        phone = cust.phone || '';
+      }
+    }
+
+    res.json({
+      ...entry,
+      outwardNo: entry.outward_no,
+      partyType: entry.party_type,
+      customerId: entry.customer_id,
+      customerName: entry.customer_name,
+      vendorId: entry.vendor_id,
+      vendorName: entry.vendor_name,
+      processName: entry.process_name,
+      coatingName: entry.coating_name,
+      purpose: entry.purpose,
+      notes: entry.notes,
+      customer_notes: resolvedCustomerNotes,
+      customerNotes: resolvedCustomerNotes,
+      address,
+      gstin,
+      phone,
+      pan,
+      invoiceReference: entry.invoice_reference,
+      challanNo: entry.challan_no,
+      vehicleNo: entry.vehicle_no,
+      driverName: entry.driver_name,
+      companyId: entry.company_id,
+      inwardId: entry.inward_id,
+      inwardNo: entry.inward_no,
+      amount: entry.amount || 0,
+      customerJobValue: entry.amount || 0,
+      jobValue: entry.amount || 0,
+      createdAt: entry.created_at,
+      items: JSON.parse(entry.items_json || '[]')
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch outward entry details', detail: error.message });
+  }
+};
+
+export const getPendingOutwardsByVendor = async (req: AuthRequest, res: Response) => {
+  const vendorId = String(req.params.vendorId);
+  const user = req.user;
+  const companyId = user?.company_id;
+
+  try {
+    // 1. Find all outwards for this vendor
+    const outwards = await prisma.outwardEntry.findMany({
+      where: {
+        AND: [
+          { company_id: String(companyId) },
+          { vendor_id: String(vendorId) },
+          { party_type: 'vendor' }
+        ]
+      }
+    });
+
+    // 2. Get all related inwards to calculate what's been returned
+    const relatedInwards = await prisma.inwardEntry.findMany({
+      where: {
+        outward_id: { in: outwards.map(o => o.id) }
+      }
+    });
+
+    // Pre-group for O(1) lookup
+    const inwardGroups = new Map<string, any[]>();
+    relatedInwards.forEach((inw: any) => {
+      const gid = String(inw.outward_id);
+      if (!inwardGroups.has(gid)) inwardGroups.set(gid, []);
+      inwardGroups.get(gid)!.push(inw);
+    });
+
+    const results = outwards.map(entry => {
+      const originalItems = JSON.parse(entry.items_json || '[]');
+      const returnedInwards = inwardGroups.get(String(entry.id)) || [];
+
+      const balanceItems = originalItems.map((item: any) => {
+        let totalReturnedQty = 0;
+        const itemIdentifier = (item.description || item.item_name || '').toLowerCase();
+
+        returnedInwards.forEach((inw: any) => {
+          const inwItems = JSON.parse(inw.items_json || '[]');
+          const matchingItem = inwItems.find((ii: any) => (ii.description || ii.item_name || '').toLowerCase() === itemIdentifier);
+          if (matchingItem) {
+            totalReturnedQty += parseFloat(matchingItem.quantity || matchingItem.qty || '0');
+          }
+        });
+
+        const original = parseFloat(item.quantity || item.qty || '0');
+        const rem = Math.max(0, original - totalReturnedQty);
+
+        return {
+          ...item,
+          originalQty: original,
+          returnedQty: totalReturnedQty,
+          remainingQty: rem
+        };
+      });
+
+      const hasBalance = balanceItems.some((item: any) => item.remainingQty > 0);
+
+      return {
+        id: entry.id,
+        outwardNo: entry.outward_no,
+        vendorName: entry.vendor_name,
+        date: entry.date,
+        processName: entry.process_name,
+        challanNo: entry.challan_no,
+        status: entry.status,
+        items: balanceItems,
+        totalRemaining: balanceItems.reduce((acc: number, cur: any) => acc + cur.remainingQty, 0),
+        hasBalance
+      };
+    }).filter(r => r.hasBalance);
+
+    res.json(results);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to calculate outward balance', detail: error.message });
+  }
+};
